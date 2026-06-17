@@ -51,7 +51,8 @@ PERSONA = os.environ.get("PERSONA", (
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI(title="Chatter-AI Engine")
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
+    allow_headers=["Authorization", "Content-Type", "*"],
 )
 
 
