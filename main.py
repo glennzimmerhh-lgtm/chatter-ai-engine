@@ -165,7 +165,7 @@ def ingest(limit: int = Query(2000, description="max messages to embed this call
             LEFT JOIN message_embeddings e ON e.msg_id = m.id
             WHERE e.msg_id IS NULL
               AND m.text IS NOT NULL AND length(trim(m.text)) > 1
-              AND m.text NOT LIKE '[%]'
+              AND m.text NOT LIKE '[%%]'
             ORDER BY m.id
             LIMIT %s
         """, (limit,))
@@ -197,7 +197,7 @@ def _remaining() -> int:
             SELECT COUNT(*) AS n FROM messages m
             LEFT JOIN message_embeddings e ON e.msg_id = m.id
             WHERE e.msg_id IS NULL AND m.text IS NOT NULL
-              AND length(trim(m.text)) > 1 AND m.text NOT LIKE '[%]'
+              AND length(trim(m.text)) > 1 AND m.text NOT LIKE '[%%]'
         """)
         return c.fetchone()["n"]
 
