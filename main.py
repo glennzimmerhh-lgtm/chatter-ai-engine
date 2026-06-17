@@ -292,6 +292,135 @@ def draft(tg_id: str,
     return DraftOut(suggestion=out, handoff=handoff, used_gold=len(gold), used_examples=len(examples))
 
 
+# ── ACT: autonomous reply + actions (function-calling brain) ──────────────────
+# The engine DECIDES (reply text + structured actions). The worker EXECUTES them
+# against its existing endpoints, behind the master switch + guardrails.
+class ActIn(BaseModel):
+    tg_id: str
+    incoming: Optional[str] = None
+    available_ppv: Optional[List[str]] = None     # vault filenames the AI may send
+    available_calls: Optional[List[str]] = None   # "folder/filename" recordings it may play
+    price_list: Optional[str] = ""
+    payment_confirmed: bool = False               # worker tells us if a payment is on file
+
+class ActOut(BaseModel):
+    reply: str
+    actions: list
+    handoff: bool
+
+ACT_TOOLS = [
+    {"type": "function", "function": {
+        "name": "send_ppv",
+        "description": "Send a media/PPV file from the vault to the fan. ONLY use a filename from the provided available list. Paid content must NOT be sent without a confirmed payment.",
+        "parameters": {"type": "object", "properties": {
+            "filename": {"type": "string", "description": "exact filename from the available list"},
+            "caption": {"type": "string", "description": "short caption, optional"}},
+            "required": ["filename"]}}},
+    {"type": "function", "function": {
+        "name": "set_funnel_stage",
+        "description": "Update the fan's sales funnel stage based on the conversation.",
+        "parameters": {"type": "object", "properties": {
+            "stage": {"type": "string", "enum": ["kalt", "warm", "hot", "angebot", "gebucht", "done"]}},
+            "required": ["stage"]}}},
+    {"type": "function", "function": {
+        "name": "start_call",
+        "description": "Start a pre-recorded call to the fan. 'fake_checks' = free warm-up check; 'paid_calls' ONLY after a confirmed payment. Use a filename from the provided available list.",
+        "parameters": {"type": "object", "properties": {
+            "folder": {"type": "string", "enum": ["fake_checks", "paid_calls"]},
+            "filename": {"type": "string", "description": "exact filename from the available list"}},
+            "required": ["folder", "filename"]}}},
+]
+
+@app.post("/act", response_model=ActOut)
+def act(body: ActIn, authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    import json
+    tg_id = body.tg_id
+    with db() as conn, conn.cursor() as c:
+        c.execute("""SELECT internal_name, anon_id, notes, funnel_stage, tg_username
+                     FROM conversations WHERE tg_id=%s""", (tg_id,))
+        prof = c.fetchone() or {}
+        c.execute("""SELECT direction, chatter, text, timestamp FROM messages
+                     WHERE tg_id=%s ORDER BY id DESC LIMIT 25""", (tg_id,))
+        hist = list(reversed(c.fetchall()))
+        c.execute("""SELECT product, amount FROM sales WHERE tg_id=%s ORDER BY id DESC LIMIT 10""", (tg_id,))
+        sales = c.fetchall()
+
+    latest_in = body.incoming or next((m["text"] for m in reversed(hist) if m["direction"] == "in"), "")
+    if not latest_in:
+        raise HTTPException(400, "no incoming message to respond to")
+
+    examples, gold = [], []
+    try:
+        qvec = _vec_literal(_embed([latest_in[:2000]])[0])
+        with db() as conn, conn.cursor() as c:
+            c.execute("""SELECT incoming, ideal_reply FROM training_examples
+                         WHERE rating='good' ORDER BY embedding <=> %s::vector LIMIT 5""", (qvec,))
+            gold = c.fetchall()
+            c.execute("""SELECT content FROM message_embeddings
+                         WHERE direction='out' AND length(content) > 8
+                         ORDER BY embedding <=> %s::vector LIMIT 6""", (qvec,))
+            examples = [r["content"] for r in c.fetchall()]
+    except Exception as e:
+        print(f"RAG retrieve skipped: {e}")
+
+    bought = ", ".join(f"{s['product']} ({s['amount']}€)" for s in sales) or "nothing yet"
+    prof_txt = (f"Fan: {prof.get('internal_name') or prof.get('anon_id') or tg_id}\n"
+                f"Funnel stage: {prof.get('funnel_stage') or 'unknown'}\n"
+                f"Notes: {prof.get('notes') or '-'}\nAlready bought: {bought}\n")
+    convo_txt = "\n".join(f"{'FAN' if m['direction']=='in' else 'YOU'}: {m['text']}" for m in hist)
+    style_txt = "\n".join(f"- {ex}" for ex in examples)
+    gold_txt = "\n".join(f"FAN: {g['incoming']}\nIDEAL REPLY: {g['ideal_reply']}" for g in gold)
+    know = _get_knowledge()
+    know_txt = "\n".join(f"- {k['content']}" for k in know)
+
+    ppv_txt = "\n".join(f"- {p}" for p in (body.available_ppv or [])) or "(none provided)"
+    calls_txt = "\n".join(f"- {c}" for c in (body.available_calls or [])) or "(none provided)"
+    pay_txt = "A payment from this fan IS confirmed." if body.payment_confirmed else \
+              "NO confirmed payment from this fan."
+
+    sys = (
+        _get_persona() + "\n\n"
+        "FACTS & RULES you must always follow:\n" + (know_txt or "(none yet)") + "\n\n"
+        "PRICE LIST:\n" + (body.price_list or "(none provided)") + "\n\n"
+        "GOLD-STANDARD examples — follow this approach and tone closely:\n"
+        + (gold_txt or "(none yet)") + "\n\n"
+        "Style references from past chats (do not copy verbatim):\n" + (style_txt or "(none)") + "\n\n"
+        "Fan profile:\n" + prof_txt + "\n"
+        "Available PPV files you may send (use EXACT names):\n" + ppv_txt + "\n\n"
+        "Available call recordings (folder/filename) you may play:\n" + calls_txt + "\n\n"
+        "PAYMENT STATUS: " + pay_txt + "\n\n"
+        "HARD RULES:\n"
+        "- NEVER send paid PPV content or start a 'paid_calls' recording unless PAYMENT STATUS confirms a payment.\n"
+        "- Only reference files that appear in the available lists above.\n"
+        "- For refunds, upset fans, or anything risky/sensitive, put [[HANDOFF]] in your reply and take no action.\n"
+    )
+    user = ("Recent conversation (YOU = the chatter, FAN = the subscriber):\n" + convo_txt + "\n\n"
+            "Decide the single best next move as YOU. Write the reply text (short, natural, the fan's language). "
+            "If an action fits (send PPV, change funnel stage, start a call), call the matching tool. "
+            "If nothing beyond replying is needed, just write the reply.")
+
+    resp = client.chat.completions.create(
+        model=AI_MODEL,
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        tools=ACT_TOOLS, tool_choice="auto",
+        temperature=0.7, max_tokens=450,
+    )
+    msg = resp.choices[0].message
+    reply = (msg.content or "").strip()
+    handoff = "[[HANDOFF]]" in reply
+    reply = reply.replace("[[HANDOFF]]", "").strip()
+    actions = []
+    if not handoff:
+        for tc in (msg.tool_calls or []):
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except Exception:
+                args = {}
+            actions.append({"tool": tc.function.name, "args": args})
+    return ActOut(reply=reply, actions=actions, handoff=handoff)
+
+
 # ── TRAINING: you teach / coach the AI ────────────────────────────────────────
 class TeachIn(BaseModel):
     incoming: str            # an example fan message / situation
