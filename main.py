@@ -112,13 +112,34 @@ def _get_price_list() -> str:
     return ""
 
 
+def _get_payment_terms() -> str:
+    """Payment conditions/terms (DB, ai_config key='payment_terms'). '' if unset."""
+    try:
+        with db() as conn, conn.cursor() as c:
+            c.execute("SELECT value FROM ai_config WHERE key='payment_terms'")
+            row = c.fetchone()
+            if row and (row["value"] or "").strip():
+                return row["value"]
+    except Exception:
+        pass
+    return ""
+
+
 # Hard anti-hallucination rule — prices were being invented; this stops it.
 PRICE_RULE = (
     "PRICE RULE (ABSOLUTE, NON-NEGOTIABLE): State prices ONLY exactly as written in the "
     "PRICE LIST below — verbatim, same number, same currency. NEVER invent, estimate, "
     "round, convert, or guess a price. If a fan asks about something not in the PRICE LIST, "
     "do NOT make up a number — say you'll quickly check. The PRICE LIST is the single source "
-    "of truth and overrides anything you might assume."
+    "of truth and overrides anything you might assume.\n"
+    "SENDING A PRICE LIST: When a fan asks for prices or a price list for a category "
+    "(calls/cam, sexchat, or PPV content), output that category's ENTIRE block EXACTLY as "
+    "written in the PRICE LIST — every single line, in full, INCLUDING the payment methods "
+    "(Zahlungsmethoden) and the fake-check note underneath it. Do NOT shorten it, do NOT "
+    "summarise, do NOT drop the payment methods or the fake-check, and do NOT replace it with "
+    "a generic line like 'sag einfach Bescheid'. Copy the whole category block 1:1. You may "
+    "add one short, natural sentence before or after, but the block itself stays complete and "
+    "unchanged."
 )
 
 
@@ -131,6 +152,9 @@ def _grounding_block(know_txt: str = None, include_price: bool = True) -> str:
     if include_price:
         pl = _get_price_list()
         parts.append("PRICE LIST (the ONLY valid prices — quote verbatim):\n" + (pl or "(none set yet)"))
+        pt = _get_payment_terms()
+        if pt:
+            parts.append("PAYMENT TERMS (Zahlungsbedingungen — always follow & communicate these):\n" + pt)
         parts.append(PRICE_RULE)
     return "\n\n".join(parts)
 
@@ -320,7 +344,7 @@ def draft(tg_id: str,
     chat = client.chat.completions.create(
         model=AI_MODEL,
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
-        temperature=0.8, max_tokens=220,
+        temperature=0.8, max_tokens=700,
     )
     out = (chat.choices[0].message.content or "").strip()
     handoff = "[[HANDOFF]]" in out
@@ -420,6 +444,8 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
         "FACTS & RULES you must always follow:\n" + (know_txt or "(none yet)") + "\n\n"
         "PRICE LIST (the ONLY valid prices — quote verbatim):\n"
         + (body.price_list or _get_price_list() or "(none set)") + "\n\n"
+        "PAYMENT TERMS (Zahlungsbedingungen — always follow):\n"
+        + (_get_payment_terms() or "(none set)") + "\n\n"
         + PRICE_RULE + "\n\n"
         "GOLD-STANDARD examples — follow this approach and tone closely:\n"
         + (gold_txt or "(none yet)") + "\n\n"
@@ -442,7 +468,7 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
         model=AI_MODEL,
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
         tools=ACT_TOOLS, tool_choice="auto",
-        temperature=0.7, max_tokens=450,
+        temperature=0.7, max_tokens=700,
     )
     msg = resp.choices[0].message
     reply = (msg.content or "").strip()
@@ -518,7 +544,8 @@ class ConfigIn(BaseModel):
 @app.get("/config")
 def get_config(authorization: Optional[str] = Header(None)):
     _auth(authorization)
-    return {"persona": _get_persona(), "price_list": _get_price_list()}
+    return {"persona": _get_persona(), "price_list": _get_price_list(),
+            "payment_terms": _get_payment_terms()}
 
 @app.post("/config")
 def set_config(body: ConfigIn, authorization: Optional[str] = Header(None)):
@@ -545,6 +572,25 @@ def set_price_list(body: PriceListIn, authorization: Optional[str] = Header(None
     with db() as conn, conn.cursor() as c:
         c.execute("INSERT INTO ai_config (key,value) VALUES ('price_list',%s) "
                   "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (body.price_list,))
+        conn.commit()
+    return {"ok": True}
+
+
+# ── PAYMENT TERMS (Zahlungsbedingungen — the AI always knows & honors them) ────
+class PaymentTermsIn(BaseModel):
+    payment_terms: str
+
+@app.get("/payment-terms")
+def get_payment_terms_ep(authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    return {"payment_terms": _get_payment_terms()}
+
+@app.post("/payment-terms")
+def set_payment_terms_ep(body: PaymentTermsIn, authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    with db() as conn, conn.cursor() as c:
+        c.execute("INSERT INTO ai_config (key,value) VALUES ('payment_terms',%s) "
+                  "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (body.payment_terms,))
         conn.commit()
     return {"ok": True}
 
@@ -603,7 +649,7 @@ def playground(body: PlaygroundIn, authorization: Optional[str] = Header(None)):
     chat = client.chat.completions.create(
         model=AI_MODEL,
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": body.message}],
-        temperature=0.8, max_tokens=220,
+        temperature=0.8, max_tokens=700,
     )
     out = (chat.choices[0].message.content or "").strip()
     return {"reply": out.replace("[[HANDOFF]]", "").strip(), "handoff": "[[HANDOFF]]" in out}
@@ -648,7 +694,8 @@ def trainer_chat(body: ChatIn, authorization: Optional[str] = Header(None)):
         TRAINER_SYS + "\n\n"
         "AKTUELLE PERSONA DER CHATTERIN:\n" + (persona or "(noch keine gesetzt)") + "\n\n"
         "BEREITS GESPEICHERTE REGELN:\n" + (know_txt or "(noch keine)") + "\n\n"
-        "AKTUELLE PREISLISTE (verbindlich):\n" + (_get_price_list() or "(noch keine)")
+        "AKTUELLE PREISLISTE (verbindlich):\n" + (_get_price_list() or "(noch keine)") + "\n\n"
+        "AKTUELLE ZAHLUNGSBEDINGUNGEN:\n" + (_get_payment_terms() or "(noch keine)")
     )
     msgs = [{"role": "system", "content": sys}]
     for m in body.messages[-20:]:
