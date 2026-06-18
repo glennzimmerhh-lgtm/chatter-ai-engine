@@ -135,6 +135,10 @@ PRICE_RULE = (
     "round, convert, or guess a price. If a fan asks about something not in the PRICE LIST, "
     "do NOT make up a number — say you'll quickly check. The PRICE LIST is the single source "
     "of truth and overrides anything you might assume.\n"
+    "FORMAT: The price list may contain internal category markers wrapped like === CALLS === / "
+    "=== SEXCHAT === / === PPV ===. These are ONLY for your understanding — NEVER write those "
+    "'=== ... ===' marker lines into a message to the fan. Send only the clean prices for the "
+    "relevant category, nicely formatted.\n"
     "SENDING A PRICE LIST: When a fan asks for prices or a price list for a category "
     "(calls/cam, sexchat, or PPV content), output that category's ENTIRE block EXACTLY as "
     "written in the PRICE LIST — every single line, in full, INCLUDING the payment methods "
@@ -142,7 +146,16 @@ PRICE_RULE = (
     "summarise, do NOT drop the payment methods or the fake-check, and do NOT replace it with "
     "a generic line like 'sag einfach Bescheid'. Copy the whole category block 1:1. You may "
     "add one short, natural sentence before or after, but the block itself stays complete and "
-    "unchanged."
+    "unchanged.\n"
+    "PAYMENT: When the fan asks how to pay (or you bring up payment), give the payment options in "
+    "FULL — never drop or summarise them. PayPal is the PREFERRED method: ALWAYS include it and "
+    "mention it FIRST; offer the other methods only as alternatives. Use the exact PayPal handle/link "
+    "and the rules (Freunde & Familie, Verwendungszweck leer, Screenshot) verbatim. Never invent "
+    "payment details.\n"
+    "LOGGING A SALE (STRICT): Only ever call log_sale when the fan has JUST sent a real payment-"
+    "confirmation in THIS latest message — i.e. a payment screenshot you can actually see right now. "
+    "NEVER log a sale based on older messages, past calls, the chat history, a verbal 'I paid', or a "
+    "promise to pay. No fresh screenshot in this message = do NOT log a sale."
 )
 
 
@@ -204,9 +217,18 @@ def _get_content_guide() -> str:
     except Exception:
         return ""
 
+STYLE_RULE = (
+    "STYLE: Write in the SAME language the fan uses — if they write German, reply in German. NEVER use "
+    "English filler like 'Sure', 'Babe' or 'Hey there' when the chat is German; write naturally like a "
+    "real flirty German girl. Use the fan's name only rarely and naturally — NOT in every message, and "
+    "never as 'Sure, <name>!'. Vary your openers; don't start every reply the same way. Sound human, "
+    "warm and a little teasing — never like a customer-service bot."
+)
+
 def _behavior_block() -> str:
-    """Sales drive + negotiation room + upsell — injected into every fan-facing reply path."""
-    return _get_sales_drive() + "\n\n" + _get_negotiation() + "\n\n" + UPSELL_RULE
+    """Sales drive + negotiation room + upsell + style — injected into every fan-facing reply path."""
+    return (_get_sales_drive() + "\n\n" + _get_negotiation() + "\n\n" + UPSELL_RULE
+            + "\n\n" + STYLE_RULE)
 
 
 def _to_float(x) -> float:
