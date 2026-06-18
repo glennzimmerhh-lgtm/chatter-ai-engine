@@ -169,6 +169,46 @@ def _get_sales_drive() -> str:
     return SALES_DRIVE_DEFAULT
 
 
+UPSELL_RULE = (
+    "UPSELL & RECOMMEND: Right after a fan buys or says they loved something, immediately offer a "
+    "fitting next step — a higher tier, a bundle, or more content. Proactively suggest the content "
+    "this specific fan is most likely to want based on what you know about them (their memory/"
+    "preferences) and what's available. Always work on raising the average order."
+)
+
+NEGOTIATION_DEFAULT = (
+    "NEGOTIATION ROOM: You have discretion to close a deal. If a fan hesitates on price, you may "
+    "offer a small discount (a few euros, up to ~15% off), throw in a small bonus, or bundle — "
+    "whatever gets the yes. Prefer adding value (bundle/bonus) over plain discounts. Never go below "
+    "~70% of the listed price, and never invent prices for things not on the list. Always log the "
+    "ACTUAL amount the fan ends up paying."
+)
+
+def _get_negotiation() -> str:
+    try:
+        with db() as conn, conn.cursor() as c:
+            c.execute("SELECT value FROM ai_config WHERE key='negotiation'")
+            row = c.fetchone()
+            if row and (row["value"] or "").strip():
+                return row["value"]
+    except Exception:
+        pass
+    return NEGOTIATION_DEFAULT
+
+def _get_content_guide() -> str:
+    try:
+        with db() as conn, conn.cursor() as c:
+            c.execute("SELECT value FROM ai_config WHERE key='content_guide'")
+            row = c.fetchone()
+            return (row["value"] or "") if row else ""
+    except Exception:
+        return ""
+
+def _behavior_block() -> str:
+    """Sales drive + negotiation room + upsell — injected into every fan-facing reply path."""
+    return _get_sales_drive() + "\n\n" + _get_negotiation() + "\n\n" + UPSELL_RULE
+
+
 def _to_float(x) -> float:
     try:
         return float(x)
@@ -433,7 +473,7 @@ def draft(tg_id: str,
     know = _get_knowledge()
     know_txt = "\n".join(f"- {k['content']}" for k in know)
     sys = (
-        _get_persona() + "\n\n" + _get_sales_drive() + "\n\n"
+        _get_persona() + "\n\n" + _behavior_block() + "\n\n"
         + _grounding_block(know_txt) + "\n\n"
         "GOLD-STANDARD examples the operator trained you on — follow this approach and tone closely:\n"
         + (gold_txt or "(none yet — operator is still training)") + "\n\n"
@@ -560,7 +600,7 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
               "NO confirmed payment from this fan."
 
     sys = (
-        _get_persona() + "\n\n" + _get_sales_drive() + "\n\n"
+        _get_persona() + "\n\n" + _behavior_block() + "\n\n"
         "FACTS & RULES you must always follow:\n" + (know_txt or "(none yet)") + "\n\n"
         "PRICE LIST (the ONLY valid prices — quote verbatim):\n"
         + (body.price_list or _get_price_list() or "(none set)") + "\n\n"
@@ -573,7 +613,9 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
         "Fan profile:\n" + prof_txt + tier_txt + _mem_block(tg_id) + "\n"
         "Available PPV files you may send (use EXACT names):\n" + ppv_txt + "\n\n"
         "Available call recordings (folder/filename) you may play:\n" + calls_txt + "\n\n"
-        "PAYMENT STATUS: " + pay_txt + "\n\n"
+        + (("CONTENT GUIDE (what your PPV files & call recordings contain — match these to the lists "
+            "above to pick the perfect one):\n" + _get_content_guide() + "\n\n") if _get_content_guide() else "")
+        + "PAYMENT STATUS: " + pay_txt + "\n\n"
         "HARD RULES:\n"
         "- Only reference files that appear in the available lists above.\n"
         "- For refunds, upset fans, or anything risky/sensitive, put [[HANDOFF]] in your reply and take no action.\n"
@@ -847,6 +889,44 @@ def set_sales_drive_ep(body: SalesDriveIn, authorization: Optional[str] = Header
     return {"ok": True}
 
 
+# ── NEGOTIATION ROOM (how much the AI may flex price to close) ────────────────
+class NegotiationIn(BaseModel):
+    negotiation: str
+
+@app.get("/negotiation")
+def get_negotiation_ep(authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    return {"negotiation": _get_negotiation(), "default": NEGOTIATION_DEFAULT}
+
+@app.post("/negotiation")
+def set_negotiation_ep(body: NegotiationIn, authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    with db() as conn, conn.cursor() as c:
+        c.execute("INSERT INTO ai_config (key,value) VALUES ('negotiation',%s) "
+                  "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (body.negotiation,))
+        conn.commit()
+    return {"ok": True}
+
+
+# ── CONTENT GUIDE (what the PPV files & call recordings contain) ──────────────
+class ContentGuideIn(BaseModel):
+    content_guide: str
+
+@app.get("/content-guide")
+def get_content_guide_ep(authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    return {"content_guide": _get_content_guide()}
+
+@app.post("/content-guide")
+def set_content_guide_ep(body: ContentGuideIn, authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    with db() as conn, conn.cursor() as c:
+        c.execute("INSERT INTO ai_config (key,value) VALUES ('content_guide',%s) "
+                  "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (body.content_guide,))
+        conn.commit()
+    return {"ok": True}
+
+
 # ── KNOWLEDGE / RULES (teach facts apart from chats) ──────────────────────────
 class KnowledgeIn(BaseModel):
     content: str
@@ -894,7 +974,7 @@ def playground(body: PlaygroundIn, authorization: Optional[str] = Header(None)):
         pass
     gold_txt = "\n".join(f"FAN: {g['incoming']}\nIDEAL: {g['ideal_reply']}" for g in gold)
     sys = (
-        _get_persona() + "\n\n" + _get_sales_drive() + "\n\n"
+        _get_persona() + "\n\n" + _behavior_block() + "\n\n"
         + _grounding_block(know_txt) + "\n\n"
         "GOLD examples:\n" + (gold_txt or "(none)")
     )
