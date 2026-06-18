@@ -146,6 +146,29 @@ PRICE_RULE = (
 )
 
 
+SALES_DRIVE_DEFAULT = (
+    "SALES DRIVE (important): Small talk and warmth are GOOD — they build the rapport and connection "
+    "that lead to sales, so do chat and be playful. But NEVER let it turn into endless small talk that "
+    "goes nowhere. Always keep the goal in the back of your mind and keep the conversation MOVING "
+    "FORWARD through the stages: warm rapport → build desire & flirt → tease what you have → make or "
+    "tee up an offer → close. A bit of back-and-forth is fine, but every few messages should advance a "
+    "step, not loop in circles. Read the fan: the moment they warm up or show ANY buying signal, lean "
+    "into the sale and go for it. Stay natural and human, not pushy — but remember you're here to earn, "
+    "so the chat should always be quietly progressing toward a purchase, not just chatting for its own sake."
+)
+
+def _get_sales_drive() -> str:
+    try:
+        with db() as conn, conn.cursor() as c:
+            c.execute("SELECT value FROM ai_config WHERE key='sales_drive'")
+            row = c.fetchone()
+            if row and (row["value"] or "").strip():
+                return row["value"]
+    except Exception:
+        pass
+    return SALES_DRIVE_DEFAULT
+
+
 def _to_float(x) -> float:
     try:
         return float(x)
@@ -410,7 +433,7 @@ def draft(tg_id: str,
     know = _get_knowledge()
     know_txt = "\n".join(f"- {k['content']}" for k in know)
     sys = (
-        _get_persona() + "\n\n"
+        _get_persona() + "\n\n" + _get_sales_drive() + "\n\n"
         + _grounding_block(know_txt) + "\n\n"
         "GOLD-STANDARD examples the operator trained you on — follow this approach and tone closely:\n"
         + (gold_txt or "(none yet — operator is still training)") + "\n\n"
@@ -528,7 +551,7 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
               "NO confirmed payment from this fan."
 
     sys = (
-        _get_persona() + "\n\n"
+        _get_persona() + "\n\n" + _get_sales_drive() + "\n\n"
         "FACTS & RULES you must always follow:\n" + (know_txt or "(none yet)") + "\n\n"
         "PRICE LIST (the ONLY valid prices — quote verbatim):\n"
         + (body.price_list or _get_price_list() or "(none set)") + "\n\n"
@@ -781,6 +804,25 @@ def set_payment_terms_ep(body: PaymentTermsIn, authorization: Optional[str] = He
     return {"ok": True}
 
 
+# ── SALES DRIVE (how hard the AI pushes toward a sale — editable) ─────────────
+class SalesDriveIn(BaseModel):
+    sales_drive: str
+
+@app.get("/sales-drive")
+def get_sales_drive_ep(authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    return {"sales_drive": _get_sales_drive(), "default": SALES_DRIVE_DEFAULT}
+
+@app.post("/sales-drive")
+def set_sales_drive_ep(body: SalesDriveIn, authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    with db() as conn, conn.cursor() as c:
+        c.execute("INSERT INTO ai_config (key,value) VALUES ('sales_drive',%s) "
+                  "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (body.sales_drive,))
+        conn.commit()
+    return {"ok": True}
+
+
 # ── KNOWLEDGE / RULES (teach facts apart from chats) ──────────────────────────
 class KnowledgeIn(BaseModel):
     content: str
@@ -828,7 +870,7 @@ def playground(body: PlaygroundIn, authorization: Optional[str] = Header(None)):
         pass
     gold_txt = "\n".join(f"FAN: {g['incoming']}\nIDEAL: {g['ideal_reply']}" for g in gold)
     sys = (
-        _get_persona() + "\n\n"
+        _get_persona() + "\n\n" + _get_sales_drive() + "\n\n"
         + _grounding_block(know_txt) + "\n\n"
         "GOLD examples:\n" + (gold_txt or "(none)")
     )
@@ -1037,6 +1079,121 @@ def seed_objections(authorization: Optional[str] = Header(None)):
         except Exception as e:
             print(f"seed objection error: {e}")
     return {"seeded": n, "skipped": False}
+
+
+# ── CHAT QA COACH (read today's chats, flag where the chatter underperformed) ─
+@app.post("/review-today")
+def review_today(limit: int = Query(40, description="max chats to review"),
+                 min_score: int = Query(8, description="flag chats scoring below this"),
+                 authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    import json as _json
+    today = datetime.now().strftime("%Y-%m-%dT00:00:00")
+    with db() as conn, conn.cursor() as c:
+        c.execute("SELECT DISTINCT tg_id FROM messages WHERE timestamp >= %s AND direction='in'", (today,))
+        ids = [r["tg_id"] for r in c.fetchall()][:limit]
+    items = []
+    for tg_id in ids:
+        with db() as conn, conn.cursor() as c:
+            c.execute("SELECT internal_name, anon_id FROM conversations WHERE tg_id=%s", (tg_id,))
+            prof = c.fetchone() or {}
+            c.execute("""SELECT direction, chatter, text FROM messages
+                         WHERE tg_id=%s AND timestamp >= %s ORDER BY id""", (tg_id, today))
+            msgs = c.fetchall()
+            c.execute("SELECT COUNT(*) AS n FROM sales WHERE tg_id=%s AND timestamp >= %s", (tg_id, today))
+            sold = (c.fetchone()["n"] or 0) > 0
+        real = [m for m in msgs if (m["text"] or "").strip() and not (m["text"] or "").strip().startswith("[")]
+        if len(real) < 4:
+            continue
+        chatter = next((m["chatter"] for m in reversed(msgs) if m["direction"] == "out" and m["chatter"]), "") or "?"
+        transcript = "\n".join(
+            f"{'FAN' if m['direction']=='in' else 'CHATTER'}: {m['text']}" for m in real)[:6000]
+        sys = ("Du bist ein knallharter, fairer Sales-QA-Coach für Adult-Chatter (Telegram/OnlyFans). "
+               "Du liest den heutigen Chat und bewertest NUR die Leistung des CHATTERS, nicht des Fans.")
+        user = ("Chat von heute:\n" + transcript + "\n\n"
+                + ("Hinweis: in diesem Chat wurde heute bereits verkauft.\n" if sold
+                   else "Hinweis: heute KEIN Verkauf in diesem Chat.\n")
+                + "Bewerte den Chatter von 1-10 (10 = perfekt). Wenn unter 8: nenne 1-3 KONKRETE Fehler "
+                  "(verpasste Kaufsignale, kein Pitch/Angebot, Einwand nicht gekontert, zu pushy, zu langsam, "
+                  "falscher/kein Preis, kein Close, kein Follow-up) und in EINEM Satz, was er besser hätte machen sollen. "
+                  'Antworte AUSSCHLIESSLICH als JSON: {"score": <int>, "issues": ["..."], "fix": "..."}')
+        try:
+            chat = client.chat.completions.create(
+                model=REPLY_MODEL,
+                messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+                temperature=0.2, max_tokens=320,
+            )
+            raw = (chat.choices[0].message.content or "").strip()
+            raw = raw.replace("```json", "").replace("```", "").strip()
+            data = _json.loads(raw)
+            score = int(data.get("score", 0))
+        except Exception as e:
+            print(f"review error {tg_id}: {e}")
+            continue
+        if score >= min_score:
+            continue
+        items.append({"tg_id": tg_id,
+                      "name": prof.get("internal_name") or prof.get("anon_id") or tg_id,
+                      "chatter": chatter, "score": score,
+                      "issues": data.get("issues", []), "fix": data.get("fix", ""),
+                      "sold_today": sold})
+    items.sort(key=lambda x: x["score"])
+    return {"reviewed": len(ids), "flagged": len(items), "items": items}
+
+
+# ── PER-CHAT COACH (review one chat + discuss it with the admin) ──────────────
+class CoachMsg(BaseModel):
+    role: str
+    content: str
+
+class CoachIn(BaseModel):
+    tg_id: str
+    messages: List[CoachMsg] = []
+
+COACH_SYS = (
+    "Du bist ein erfahrener, ehrlicher Sales-Coach für Adult-Chatter (Telegram/OnlyFans). "
+    "Du analysierst EINEN konkreten Chat und coachst den Betreiber dazu. Bewerte nur den CHATTER, "
+    "nicht den Fan. Sei konkret, direkt und konstruktiv — sag klar, wo verkackt wurde (verpasste "
+    "Kaufsignale, kein Pitch/Angebot, Einwand nicht gekontert, falscher/kein Preis, zu pushy, zu "
+    "langsam, kein Close, kein Follow-up) und was konkret besser gewesen wäre. Der Betreiber kann "
+    "dir widersprechen oder seine Sicht schildern — geh darauf ein, bleib aber ehrlich."
+)
+
+@app.post("/coach")
+def coach(body: CoachIn, authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    tg_id = body.tg_id
+    with db() as conn, conn.cursor() as c:
+        c.execute("SELECT internal_name, anon_id, funnel_stage FROM conversations WHERE tg_id=%s", (tg_id,))
+        prof = c.fetchone() or {}
+        c.execute("""SELECT direction, chatter, text FROM messages
+                     WHERE tg_id=%s ORDER BY id DESC LIMIT 50""", (tg_id,))
+        msgs = list(reversed(c.fetchall()))
+        c.execute("SELECT product, amount FROM sales WHERE tg_id=%s ORDER BY id DESC LIMIT 10", (tg_id,))
+        sales = c.fetchall()
+    real = [m for m in msgs if (m["text"] or "").strip()]
+    transcript = "\n".join(
+        f"{'FAN' if m['direction']=='in' else 'CHATTER'}: {m['text']}" for m in real)[:8000]
+    bought = ", ".join(f"{s['product']} ({s['amount']}€)" for s in sales) or "nichts"
+    name = prof.get("internal_name") or prof.get("anon_id") or tg_id
+    sys = (COACH_SYS + "\n\n"
+           + _grounding_block() + "\n\n"
+           f"FAN: {name} | Funnel: {prof.get('funnel_stage') or '-'} | bisher gekauft: {bought}\n\n"
+           "DER ZU ANALYSIERENDE CHAT (CHATTER = dein Mitarbeiter, FAN = der Sub):\n" + transcript)
+    out_msgs = [{"role": "system", "content": sys}]
+    if not body.messages:
+        out_msgs.append({"role": "user", "content":
+            "Gib mir dein erstes ehrliches Feedback zu diesem Chat: kurz was gut lief, dann klar wo "
+            "der Chatter verkackt hat und was er konkret hätte besser machen sollen. Am Ende eine Zeile "
+            "'Score: x/10'. Halte es kompakt und auf Deutsch."})
+    else:
+        for m in body.messages[-20:]:
+            role = m.role if m.role in ("user", "assistant") else "user"
+            out_msgs.append({"role": role, "content": m.content[:4000]})
+    chat = client.chat.completions.create(
+        model=REPLY_MODEL, messages=out_msgs, temperature=0.4, max_tokens=600,
+    )
+    return {"reply": (chat.choices[0].message.content or "").strip()}
 
 
 if __name__ == "__main__":
