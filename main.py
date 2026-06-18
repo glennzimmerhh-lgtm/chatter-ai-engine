@@ -33,6 +33,9 @@ from openai import OpenAI
 DATABASE_URL = os.environ["DATABASE_URL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 AI_MODEL = os.environ.get("AI_MODEL", "gpt-4o-mini")
+# Model used for the actual fan-facing replies — set AI_REPLY_MODEL=gpt-4o for
+# noticeably deeper understanding (still fast, <20s). Falls back to AI_MODEL.
+REPLY_MODEL = os.environ.get("AI_REPLY_MODEL", AI_MODEL)
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
 EMBED_DIM = 1536  # text-embedding-3-small
 API_TOKEN = os.environ.get("API_TOKEN", "")
@@ -143,6 +146,51 @@ PRICE_RULE = (
 )
 
 
+def _to_float(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+def _spend_tier(total: float):
+    """(label, tactic) by lifetime spend — lets the AI tailor its approach per fan."""
+    if total >= 200:
+        return ("WHALE (200€+ lifetime)",
+                "Top spender. Be warm, exclusive and confident — skip cheap teasers, push premium "
+                "content, bundles, calls and customs. Make them feel like a VIP, raise the average order.")
+    if total >= 100:
+        return ("BIG spender (100€+)",
+                "Strong buyer. Upsell to bundles and higher tiers, never undersell.")
+    if total >= 50:
+        return ("MID spender (50€+)",
+                "Proven buyer. Nudge toward bundles and the next price tier up.")
+    if total >= 15:
+        return ("LOW spender (15€+)",
+                "Small buyer so far. Build trust and offer good-value bundles to raise spend.")
+    if total > 0:
+        return ("STARTER (first small buy)",
+                "Just started buying. Reinforce the decision and offer an easy next step.")
+    return ("NEW (no purchase yet)",
+            "Has not bought yet. Focus on rapport and a low-friction first offer to convert.")
+
+
+def _get_fan_memory(tg_id: str) -> str:
+    try:
+        with db() as conn, conn.cursor() as c:
+            c.execute("SELECT summary FROM fan_memory WHERE tg_id=%s", (tg_id,))
+            row = c.fetchone()
+            return (row["summary"] or "") if row else ""
+    except Exception:
+        return ""
+
+
+def _mem_block(tg_id: str) -> str:
+    m = _get_fan_memory(tg_id)
+    return ("\n\nWHAT YOU ALREADY KNOW ABOUT THIS FAN (long-term memory — use it to feel like you "
+            "remember everything about them):\n" + m) if m else ""
+
+
 def _grounding_block(know_txt: str = None, include_price: bool = True) -> str:
     """Consistent FACTS + PRICE LIST + price rule block, injected into every generation path."""
     if know_txt is None:
@@ -185,13 +233,25 @@ def setup():
                     tags        TEXT DEFAULT '',
                     rating      TEXT DEFAULT 'good',
                     source      TEXT DEFAULT 'manual',
+                    amount      NUMERIC DEFAULT 0,
                     created_at  TIMESTAMPTZ DEFAULT now(),
                     embedding   vector({EMBED_DIM})
                 )
             """)
+            try:
+                c.execute("ALTER TABLE training_examples ADD COLUMN IF NOT EXISTS amount NUMERIC DEFAULT 0")
+            except Exception:
+                pass
             # Editable persona/system-prompt + general knowledge/rules (not tied to chats)
             c.execute("CREATE TABLE IF NOT EXISTS ai_config (key TEXT PRIMARY KEY, value TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS knowledge (id SERIAL PRIMARY KEY, content TEXT, created_at TIMESTAMPTZ DEFAULT now())")
+            # Per-fan living memory — a distilled profile the AI keeps about each fan
+            c.execute("""CREATE TABLE IF NOT EXISTS fan_memory (
+                tg_id      TEXT PRIMARY KEY,
+                summary    TEXT DEFAULT '',
+                msg_count  INT DEFAULT 0,
+                updated_at TIMESTAMPTZ DEFAULT now()
+            )""")
             conn.commit()
         print("✅ message_embeddings ready (pgvector)")
     except Exception as e:
@@ -300,7 +360,7 @@ def draft(tg_id: str,
         with db() as conn, conn.cursor() as c:
             c.execute("""SELECT incoming, ideal_reply FROM training_examples
                          WHERE rating='good'
-                         ORDER BY embedding <=> %s::vector LIMIT 5""", (qvec,))
+                         ORDER BY (embedding <=> %s::vector) - LEAST(COALESCE(amount,0),200)*0.0004 LIMIT 5""", (qvec,))
             gold = c.fetchall()
             c.execute("""SELECT content FROM message_embeddings
                          WHERE direction='out' AND length(content) > 8
@@ -311,6 +371,10 @@ def draft(tg_id: str,
 
     # Build prompt
     bought = ", ".join(f"{s['product']} ({s['amount']}€)" for s in sales) or "nothing yet"
+    total_spend = sum(_to_float(s["amount"]) for s in sales)
+    tier_label, tier_tactic = _spend_tier(total_spend)
+    tier_txt = (f"\nSPEND TIER: {tier_label} (lifetime {total_spend:.0f}€)\n"
+                f"SALES TACTIC FOR THIS FAN: {tier_tactic}")
     prof_txt = (
         f"Fan: {prof.get('internal_name') or prof.get('anon_id') or tg_id}\n"
         f"Funnel stage: {prof.get('funnel_stage') or 'unknown'}\n"
@@ -332,7 +396,7 @@ def draft(tg_id: str,
         + (gold_txt or "(none yet — operator is still training)") + "\n\n"
         "Additional style references from past chats (do not copy verbatim):\n"
         + (style_txt or "(none)") + "\n\n"
-        "Fan profile:\n" + prof_txt
+        "Fan profile:\n" + prof_txt + tier_txt + _mem_block(tg_id)
     )
     user = (
         "Recent conversation (YOU = the chatter, FAN = the subscriber):\n"
@@ -342,7 +406,7 @@ def draft(tg_id: str,
     )
 
     chat = client.chat.completions.create(
-        model=AI_MODEL,
+        model=REPLY_MODEL,
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
         temperature=0.8, max_tokens=700,
     )
@@ -415,7 +479,7 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
         qvec = _vec_literal(_embed([latest_in[:2000]])[0])
         with db() as conn, conn.cursor() as c:
             c.execute("""SELECT incoming, ideal_reply FROM training_examples
-                         WHERE rating='good' ORDER BY embedding <=> %s::vector LIMIT 5""", (qvec,))
+                         WHERE rating='good' ORDER BY (embedding <=> %s::vector) - LEAST(COALESCE(amount,0),200)*0.0004 LIMIT 5""", (qvec,))
             gold = c.fetchall()
             c.execute("""SELECT content FROM message_embeddings
                          WHERE direction='out' AND length(content) > 8
@@ -425,6 +489,10 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
         print(f"RAG retrieve skipped: {e}")
 
     bought = ", ".join(f"{s['product']} ({s['amount']}€)" for s in sales) or "nothing yet"
+    total_spend = sum(_to_float(s["amount"]) for s in sales)
+    tier_label, tier_tactic = _spend_tier(total_spend)
+    tier_txt = (f"\nSPEND TIER: {tier_label} (lifetime {total_spend:.0f}€)\n"
+                f"SALES TACTIC FOR THIS FAN: {tier_tactic}")
     prof_txt = (f"Fan: {prof.get('internal_name') or prof.get('anon_id') or tg_id}\n"
                 f"Funnel stage: {prof.get('funnel_stage') or 'unknown'}\n"
                 f"Notes: {prof.get('notes') or '-'}\nAlready bought: {bought}\n")
@@ -450,7 +518,7 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
         "GOLD-STANDARD examples — follow this approach and tone closely:\n"
         + (gold_txt or "(none yet)") + "\n\n"
         "Style references from past chats (do not copy verbatim):\n" + (style_txt or "(none)") + "\n\n"
-        "Fan profile:\n" + prof_txt + "\n"
+        "Fan profile:\n" + prof_txt + tier_txt + _mem_block(tg_id) + "\n"
         "Available PPV files you may send (use EXACT names):\n" + ppv_txt + "\n\n"
         "Available call recordings (folder/filename) you may play:\n" + calls_txt + "\n\n"
         "PAYMENT STATUS: " + pay_txt + "\n\n"
@@ -465,7 +533,7 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
             "If nothing beyond replying is needed, just write the reply.")
 
     resp = client.chat.completions.create(
-        model=AI_MODEL,
+        model=REPLY_MODEL,
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
         tools=ACT_TOOLS, tool_choice="auto",
         temperature=0.7, max_tokens=700,
@@ -485,6 +553,104 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
     return ActOut(reply=reply, actions=actions, handoff=handoff)
 
 
+# ── FOLLOW-UP: re-engage a fan who went quiet (recover lost sales) ────────────
+class FollowupIn(BaseModel):
+    tg_id: str
+
+class FollowupOut(BaseModel):
+    reply: str
+    handoff: bool
+
+@app.post("/followup", response_model=FollowupOut)
+def followup(body: FollowupIn, authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    tg_id = body.tg_id
+    with db() as conn, conn.cursor() as c:
+        c.execute("SELECT internal_name, anon_id, notes, funnel_stage FROM conversations WHERE tg_id=%s", (tg_id,))
+        prof = c.fetchone() or {}
+        c.execute("SELECT direction, text FROM messages WHERE tg_id=%s ORDER BY id DESC LIMIT 15", (tg_id,))
+        hist = list(reversed(c.fetchall()))
+        c.execute("SELECT product, amount FROM sales WHERE tg_id=%s ORDER BY id DESC LIMIT 10", (tg_id,))
+        sales = c.fetchall()
+    total_spend = sum(_to_float(s["amount"]) for s in sales)
+    tier_label, tier_tactic = _spend_tier(total_spend)
+    convo_txt = "\n".join(f"{'FAN' if m['direction']=='in' else 'YOU'}: {m['text']}" for m in hist)
+    sys = (_get_persona() + "\n\n" + _grounding_block() + "\n\n"
+           f"Fan: {prof.get('internal_name') or prof.get('anon_id') or tg_id} | "
+           f"stage: {prof.get('funnel_stage') or '-'} | tier: {tier_label}\n"
+           f"SALES TACTIC FOR THIS FAN: {tier_tactic}" + _mem_block(tg_id))
+    user = ("This fan went quiet — your last message or offer got no reply. "
+            "Write ONE short, charming re-engagement opener as YOU to pull them back into the chat. "
+            "Casual and warm, NOT pushy or desperate, in the fan's language; build a little curiosity. "
+            "If the situation is sensitive (refund, upset, complaint), output [[HANDOFF]] only.\n\n"
+            "Recent conversation (YOU = the chatter, FAN = the subscriber):\n" + convo_txt
+            + "\n\nOutput ONLY the message text.")
+    chat = client.chat.completions.create(
+        model=REPLY_MODEL,
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        temperature=0.85, max_tokens=200,
+    )
+    out = (chat.choices[0].message.content or "").strip()
+    handoff = "[[HANDOFF]]" in out
+    out = out.replace("[[HANDOFF]]", "").strip()
+    return FollowupOut(reply=out, handoff=handoff)
+
+
+# ── FAN MEMORY (build/refresh the living per-fan profile — runs in background) ─
+class MemoryIn(BaseModel):
+    tg_id: str
+    force: bool = False
+
+@app.post("/refresh-memory")
+def refresh_memory(body: MemoryIn, authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    tg_id = body.tg_id
+    with db() as conn, conn.cursor() as c:
+        c.execute("SELECT COUNT(*) AS n FROM messages WHERE tg_id=%s", (tg_id,))
+        total = c.fetchone()["n"]
+        c.execute("SELECT msg_count FROM fan_memory WHERE tg_id=%s", (tg_id,))
+        row = c.fetchone()
+        prev = row["msg_count"] if row else -1
+    if not body.force and prev >= 0 and (total - prev) < 4:
+        return {"updated": False, "reason": "no new messages"}
+    with db() as conn, conn.cursor() as c:
+        c.execute("SELECT internal_name, anon_id, notes, funnel_stage FROM conversations WHERE tg_id=%s", (tg_id,))
+        prof = c.fetchone() or {}
+        c.execute("SELECT direction, text FROM messages WHERE tg_id=%s ORDER BY id DESC LIMIT 60", (tg_id,))
+        hist = list(reversed(c.fetchall()))
+        c.execute("SELECT product, amount FROM sales WHERE tg_id=%s ORDER BY id DESC LIMIT 10", (tg_id,))
+        sales = c.fetchall()
+    if not hist:
+        return {"updated": False, "reason": "no messages"}
+    convo = "\n".join(f"{'FAN' if m['direction']=='in' else 'YOU'}: {m['text']}" for m in hist)
+    bought = ", ".join(f"{s['product']} ({s['amount']}€)" for s in sales) or "nothing yet"
+    sys = ("You maintain a concise CRM memory profile of an adult-content fan for the chatter team. "
+           "Extract only durable, useful facts. Be specific and brief — this is internal sales intel, not a reply.")
+    user = (f"Existing notes: {prof.get('notes') or '-'}\nBought so far: {bought}\n\n"
+            "Conversation:\n" + convo + "\n\n"
+            "Write a tight profile (max ~120 words, short lines) covering, only where the chat supports it: "
+            "name/age/location, what turns them on / kinks & preferences, which content or offers they reacted to, "
+            "objections or hesitations they raised, the personality & tone that works on them, and their current buying intent. "
+            "Output plain text, no preamble, no markdown headers.")
+    try:
+        chat = client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            temperature=0.3, max_tokens=260,
+        )
+        summary = (chat.choices[0].message.content or "").strip()
+    except Exception as e:
+        raise HTTPException(500, f"summary failed: {e}")
+    with db() as conn, conn.cursor() as c:
+        c.execute("""INSERT INTO fan_memory (tg_id, summary, msg_count, updated_at)
+                     VALUES (%s,%s,%s,now())
+                     ON CONFLICT (tg_id) DO UPDATE SET summary=EXCLUDED.summary,
+                       msg_count=EXCLUDED.msg_count, updated_at=now()""",
+                  (tg_id, summary[:2000], total))
+        conn.commit()
+    return {"updated": True, "summary": summary}
+
+
 # ── TRAINING: you teach / coach the AI ────────────────────────────────────────
 class TeachIn(BaseModel):
     incoming: str            # an example fan message / situation
@@ -499,13 +665,13 @@ class FeedbackIn(BaseModel):
     rating: str = "good"     # 'good' = use as gold example, 'bad' = avoid this style
     note: str = ""
 
-def _store_example(incoming: str, ideal_reply: str, tags: str, rating: str, source: str):
+def _store_example(incoming: str, ideal_reply: str, tags: str, rating: str, source: str, amount: float = 0):
     vec = _vec_literal(_embed([incoming[:2000]])[0])
     with db() as conn, conn.cursor() as c:
         c.execute(
-            "INSERT INTO training_examples (incoming,ideal_reply,tags,rating,source,embedding) "
-            "VALUES (%s,%s,%s,%s,%s,%s::vector) RETURNING id",
-            (incoming[:4000], ideal_reply[:4000], tags, rating, source, vec),
+            "INSERT INTO training_examples (incoming,ideal_reply,tags,rating,source,amount,embedding) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s::vector) RETURNING id",
+            (incoming[:4000], ideal_reply[:4000], tags, rating, source, amount or 0, vec),
         )
         new_id = c.fetchone()["id"]
         conn.commit()
@@ -647,7 +813,7 @@ def playground(body: PlaygroundIn, authorization: Optional[str] = Header(None)):
         "GOLD examples:\n" + (gold_txt or "(none)")
     )
     chat = client.chat.completions.create(
-        model=AI_MODEL,
+        model=REPLY_MODEL,
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": body.message}],
         temperature=0.8, max_tokens=700,
     )
@@ -799,13 +965,58 @@ def mine_winning(limit: int = Query(400, description="how many recent sales to s
         if not incoming or not closing:
             continue
         try:
+            try:
+                _amt = float(s["amount"] or 0)
+            except Exception:
+                _amt = 0
             _store_example(incoming, closing,
                            f"winning,{sale_tag},{(s['product'] or '').strip()}",
-                           "good", "winning")
+                           "good", "winning", amount=_amt)
             mined += 1
         except Exception as e:
             print(f"mine store error: {e}")
     return {"mined_now": mined, "skipped_existing": skipped, "sales_scanned": scanned}
+
+
+# ── OBJECTION LIBRARY (seed proven rebuttals as editable gold examples) ───────
+OBJECTION_SEEDS = [
+    ("das ist mir zu teuer",
+     "ich versteh dich 🙈 aber glaub mir, das ist jeden cent wert.. ich mach was ganz besonderes nur für dich 😘 sollen wir?"),
+    ("ich überleg's mir / vielleicht später",
+     "klar, lass dir zeit 💕 aber ich bin grad richtig in stimmung und hab heute noch zeit für dich.. wär schade das zu verpassen, oder? 😏"),
+    ("woher weiß ich dass du echt bist",
+     "total verständlich 🙈 ich mach dir nen kurzen fake-check per videoanruf oder sprachnachricht, dann siehst du dass ich echt bin 😘 nur einen, okay?"),
+    ("wenn ich zahle, ghostest du mich dann",
+     "niemals 💕 sobald deine zahlung da ist leg ich direkt für dich los, versprochen. schick mir nach der zahlung kurz nen screenshot und wir starten sofort 😏"),
+    ("kannst du den preis nicht runtermachen",
+     "für dich mach ich gern was draus 😘 statt einzeln geb ich dir ein kleines bundle, dann hast du mehr und zahlst pro stück weniger.. klingt das gut?"),
+    ("ich hab grad kein geld",
+     "kein stress 💕 sag einfach bescheid wenn's passt.. ich merk dir schon mal vor was du willst, dann geht's beim nächsten mal ganz schnell 😉"),
+    ("kann ich erst den content sehen und dann zahlen",
+     "ich schick dir gern nen kleinen vorgeschmack 😘 das volle gibt's nach der zahlung, so bleibt's fair für uns beide 💕"),
+    ("ist das diskret und anonym",
+     "100% 🙈 das bleibt komplett unter uns, niemand erfährt was.. du kannst dich ganz entspannen 😘"),
+]
+
+@app.post("/seed-objections")
+def seed_objections(authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    try:
+        with db() as conn, conn.cursor() as c:
+            c.execute("SELECT COUNT(*) AS n FROM training_examples WHERE source='seed'")
+            if (c.fetchone()["n"] or 0) > 0:
+                return {"seeded": 0, "skipped": True,
+                        "note": "Einwand-Bibliothek ist schon angelegt — du kannst die Antworten unter Beispielen verfeinern."}
+    except Exception:
+        pass
+    n = 0
+    for inc, rep in OBJECTION_SEEDS:
+        try:
+            _store_example(inc, rep, "objection,seed", "good", "seed")
+            n += 1
+        except Exception as e:
+            print(f"seed objection error: {e}")
+    return {"seeded": n, "skipped": False}
 
 
 if __name__ == "__main__":
