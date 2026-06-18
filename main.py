@@ -663,6 +663,7 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
 # ── FOLLOW-UP: re-engage a fan who went quiet (recover lost sales) ────────────
 class FollowupIn(BaseModel):
     tg_id: str
+    context: Optional[str] = ""   # e.g. "fan is online right now"
 
 class FollowupOut(BaseModel):
     reply: str
@@ -686,7 +687,9 @@ def followup(body: FollowupIn, authorization: Optional[str] = Header(None)):
            f"Fan: {prof.get('internal_name') or prof.get('anon_id') or tg_id} | "
            f"stage: {prof.get('funnel_stage') or '-'} | tier: {tier_label}\n"
            f"SALES TACTIC FOR THIS FAN: {tier_tactic}" + _mem_block(tg_id))
-    user = ("This fan went quiet after your last message. Write ONE short, charming follow-up as YOU "
+    ctx_line = (f"CONTEXT: {body.context}\n" if (body.context or "").strip() else "")
+    user = (ctx_line
+            + "This fan went quiet after your last message. Write ONE short, charming follow-up as YOU "
             "that pulls them back AND moves toward the sale — not just 'hey, you still there?'. "
             "If you already sent prices or made an offer and they didn't reply, gently chase it: remind "
             "them what they were about to get, add warmth/teasing and a little urgency, and make it easy "
