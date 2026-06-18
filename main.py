@@ -469,6 +469,7 @@ class ActIn(BaseModel):
     available_calls: Optional[List[str]] = None   # "folder/filename" recordings it may play
     price_list: Optional[str] = ""
     payment_confirmed: bool = False               # worker tells us if a payment is on file
+    image_b64: Optional[str] = None               # base64 JPEG/PNG the fan just sent (vision)
 
 class ActOut(BaseModel):
     reply: str
@@ -496,6 +497,14 @@ ACT_TOOLS = [
             "folder": {"type": "string", "enum": ["fake_checks", "paid_calls"]},
             "filename": {"type": "string", "description": "exact filename from the available list"}},
             "required": ["folder", "filename"]}}},
+    {"type": "function", "function": {
+        "name": "log_sale",
+        "description": "Record a confirmed sale in the CRM. Call this when the fan has paid — e.g. they sent a payment-confirmation screenshot showing a COMPLETED payment with an amount, or payment is otherwise confirmed. Use the amount from the proof and the matching product/price from the PRICE LIST.",
+        "parameters": {"type": "object", "properties": {
+            "amount": {"type": "number", "description": "amount paid in EUR"},
+            "product": {"type": "string", "description": "what was sold, e.g. 'PPV Video', 'Call 10min', 'Sexting 30min'"},
+            "method": {"type": "string", "description": "payment method: PayPal, Revolut, Überweisung, Paysafe, Amazon"}},
+            "required": ["amount"]}}},
 ]
 
 @app.post("/act", response_model=ActOut)
@@ -566,18 +575,31 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
         "Available call recordings (folder/filename) you may play:\n" + calls_txt + "\n\n"
         "PAYMENT STATUS: " + pay_txt + "\n\n"
         "HARD RULES:\n"
-        "- NEVER send paid PPV content or start a 'paid_calls' recording unless PAYMENT STATUS confirms a payment.\n"
         "- Only reference files that appear in the available lists above.\n"
         "- For refunds, upset fans, or anything risky/sensitive, put [[HANDOFF]] in your reply and take no action.\n"
+        "- PAYMENT PROOF: If the fan sends an IMAGE, look at it. If it is a payment-confirmation "
+        "screenshot showing a COMPLETED payment with an amount, treat the payment as done: call "
+        "log_sale with that amount and the matching product from the PRICE LIST, then deliver what "
+        "they paid for (send_ppv / start_call). If the image is unclear, incomplete, not actually a "
+        "payment, or looks edited/fake, do NOT log a sale — politely ask for a proper confirmation.\n"
     )
     user = ("Recent conversation (YOU = the chatter, FAN = the subscriber):\n" + convo_txt + "\n\n"
             "Decide the single best next move as YOU. Write the reply text (short, natural, the fan's language). "
-            "If an action fits (send PPV, change funnel stage, start a call), call the matching tool. "
+            "If an action fits (send PPV, change funnel stage, start a call, log a sale), call the matching tool. "
             "If nothing beyond replying is needed, just write the reply.")
 
+    if body.image_b64:
+        user_content = [
+            {"type": "text", "text": user + "\n\nThe fan just sent the attached image — look at it carefully."},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + body.image_b64}},
+        ]
+        model = REPLY_MODEL   # payment proof / image = key moment → strong vision model
+    else:
+        user_content = user
+        model = _reply_model_for(total_spend, prof.get("funnel_stage"), latest_in)
     resp = client.chat.completions.create(
-        model=_reply_model_for(total_spend, prof.get("funnel_stage"), latest_in),
-        messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        model=model,
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": user_content}],
         tools=ACT_TOOLS, tool_choice="auto",
         temperature=0.7, max_tokens=700,
     )
@@ -622,9 +644,11 @@ def followup(body: FollowupIn, authorization: Optional[str] = Header(None)):
            f"Fan: {prof.get('internal_name') or prof.get('anon_id') or tg_id} | "
            f"stage: {prof.get('funnel_stage') or '-'} | tier: {tier_label}\n"
            f"SALES TACTIC FOR THIS FAN: {tier_tactic}" + _mem_block(tg_id))
-    user = ("This fan went quiet — your last message or offer got no reply. "
-            "Write ONE short, charming re-engagement opener as YOU to pull them back into the chat. "
-            "Casual and warm, NOT pushy or desperate, in the fan's language; build a little curiosity. "
+    user = ("This fan went quiet after your last message. Write ONE short, charming follow-up as YOU "
+            "that pulls them back AND moves toward the sale — not just 'hey, you still there?'. "
+            "If you already sent prices or made an offer and they didn't reply, gently chase it: remind "
+            "them what they were about to get, add warmth/teasing and a little urgency, and make it easy "
+            "to say yes. Casual and human, in the fan's language, NOT desperate or spammy. "
             "If the situation is sensitive (refund, upset, complaint), output [[HANDOFF]] only.\n\n"
             "Recent conversation (YOU = the chatter, FAN = the subscriber):\n" + convo_txt
             + "\n\nOutput ONLY the message text.")
