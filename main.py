@@ -99,6 +99,42 @@ def _get_knowledge() -> list:
         return []
 
 
+def _get_price_list() -> str:
+    """The authoritative price list (DB, ai_config key='price_list'). '' if unset."""
+    try:
+        with db() as conn, conn.cursor() as c:
+            c.execute("SELECT value FROM ai_config WHERE key='price_list'")
+            row = c.fetchone()
+            if row and (row["value"] or "").strip():
+                return row["value"]
+    except Exception:
+        pass
+    return ""
+
+
+# Hard anti-hallucination rule — prices were being invented; this stops it.
+PRICE_RULE = (
+    "PRICE RULE (ABSOLUTE, NON-NEGOTIABLE): State prices ONLY exactly as written in the "
+    "PRICE LIST below — verbatim, same number, same currency. NEVER invent, estimate, "
+    "round, convert, or guess a price. If a fan asks about something not in the PRICE LIST, "
+    "do NOT make up a number — say you'll quickly check. The PRICE LIST is the single source "
+    "of truth and overrides anything you might assume."
+)
+
+
+def _grounding_block(know_txt: str = None, include_price: bool = True) -> str:
+    """Consistent FACTS + PRICE LIST + price rule block, injected into every generation path."""
+    if know_txt is None:
+        know = _get_knowledge()
+        know_txt = "\n".join(f"- {k['content']}" for k in know)
+    parts = ["FACTS & RULES you must always follow:\n" + (know_txt or "(none yet)")]
+    if include_price:
+        pl = _get_price_list()
+        parts.append("PRICE LIST (the ONLY valid prices — quote verbatim):\n" + (pl or "(none set yet)"))
+        parts.append(PRICE_RULE)
+    return "\n\n".join(parts)
+
+
 # ── SETUP ─────────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 def setup():
@@ -267,7 +303,7 @@ def draft(tg_id: str,
     know_txt = "\n".join(f"- {k['content']}" for k in know)
     sys = (
         _get_persona() + "\n\n"
-        "FACTS & RULES you must always follow:\n" + (know_txt or "(none yet)") + "\n\n"
+        + _grounding_block(know_txt) + "\n\n"
         "GOLD-STANDARD examples the operator trained you on — follow this approach and tone closely:\n"
         + (gold_txt or "(none yet — operator is still training)") + "\n\n"
         "Additional style references from past chats (do not copy verbatim):\n"
@@ -382,7 +418,9 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
     sys = (
         _get_persona() + "\n\n"
         "FACTS & RULES you must always follow:\n" + (know_txt or "(none yet)") + "\n\n"
-        "PRICE LIST:\n" + (body.price_list or "(none provided)") + "\n\n"
+        "PRICE LIST (the ONLY valid prices — quote verbatim):\n"
+        + (body.price_list or _get_price_list() or "(none set)") + "\n\n"
+        + PRICE_RULE + "\n\n"
         "GOLD-STANDARD examples — follow this approach and tone closely:\n"
         + (gold_txt or "(none yet)") + "\n\n"
         "Style references from past chats (do not copy verbatim):\n" + (style_txt or "(none)") + "\n\n"
@@ -480,7 +518,7 @@ class ConfigIn(BaseModel):
 @app.get("/config")
 def get_config(authorization: Optional[str] = Header(None)):
     _auth(authorization)
-    return {"persona": _get_persona()}
+    return {"persona": _get_persona(), "price_list": _get_price_list()}
 
 @app.post("/config")
 def set_config(body: ConfigIn, authorization: Optional[str] = Header(None)):
@@ -488,6 +526,25 @@ def set_config(body: ConfigIn, authorization: Optional[str] = Header(None)):
     with db() as conn, conn.cursor() as c:
         c.execute("INSERT INTO ai_config (key,value) VALUES ('persona',%s) "
                   "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (body.persona,))
+        conn.commit()
+    return {"ok": True}
+
+
+# ── PRICE LIST (the authoritative prices — grounds the AI so it never invents) ─
+class PriceListIn(BaseModel):
+    price_list: str
+
+@app.get("/price-list")
+def get_price_list(authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    return {"price_list": _get_price_list()}
+
+@app.post("/price-list")
+def set_price_list(body: PriceListIn, authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    with db() as conn, conn.cursor() as c:
+        c.execute("INSERT INTO ai_config (key,value) VALUES ('price_list',%s) "
+                  "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (body.price_list,))
         conn.commit()
     return {"ok": True}
 
@@ -540,7 +597,7 @@ def playground(body: PlaygroundIn, authorization: Optional[str] = Header(None)):
     gold_txt = "\n".join(f"FAN: {g['incoming']}\nIDEAL: {g['ideal_reply']}" for g in gold)
     sys = (
         _get_persona() + "\n\n"
-        "FACTS & RULES:\n" + (know_txt or "(none)") + "\n\n"
+        + _grounding_block(know_txt) + "\n\n"
         "GOLD examples:\n" + (gold_txt or "(none)")
     )
     chat = client.chat.completions.create(
@@ -590,7 +647,8 @@ def trainer_chat(body: ChatIn, authorization: Optional[str] = Header(None)):
     sys = (
         TRAINER_SYS + "\n\n"
         "AKTUELLE PERSONA DER CHATTERIN:\n" + (persona or "(noch keine gesetzt)") + "\n\n"
-        "BEREITS GESPEICHERTE REGELN:\n" + (know_txt or "(noch keine)")
+        "BEREITS GESPEICHERTE REGELN:\n" + (know_txt or "(noch keine)") + "\n\n"
+        "AKTUELLE PREISLISTE (verbindlich):\n" + (_get_price_list() or "(noch keine)")
     )
     msgs = [{"role": "system", "content": sys}]
     for m in body.messages[-20:]:
@@ -626,6 +684,81 @@ def apply_persona(body: PersonaApply, authorization: Optional[str] = Header(None
                   "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (body.persona,))
         conn.commit()
     return {"ok": True}
+
+
+# ── WINNING-CHAT MINER (learn from conversations that actually closed money) ──
+# For every real sale, grab the fan's last message before the sale and the
+# chatter's closing reply, and store it as a GOLD example. The AI then learns
+# the exact wording/timing that converted — not theory. This is the biggest
+# single lever to make it outperform average chatters.
+@app.post("/mine-winning")
+def mine_winning(limit: int = Query(400, description="how many recent sales to scan"),
+                 authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    mined, skipped, scanned = 0, 0, 0
+    try:
+        with db() as conn, conn.cursor() as c:
+            c.execute("SELECT id, tg_id, product, amount, timestamp FROM sales "
+                      "ORDER BY id DESC LIMIT %s", (limit,))
+            sales = c.fetchall()
+    except Exception as e:
+        raise HTTPException(500, f"sales read failed: {e}")
+
+    scanned = len(sales)
+    for s in sales:
+        sale_tag = f"sale{s['id']}"
+        # dedup — never mine the same sale twice
+        try:
+            with db() as conn, conn.cursor() as c:
+                c.execute("SELECT 1 FROM training_examples WHERE source='winning' "
+                          "AND tags LIKE %s LIMIT 1", (f"%{sale_tag}%",))
+                if c.fetchone():
+                    skipped += 1
+                    continue
+        except Exception:
+            pass
+        # the exchange leading up to the sale (chronological)
+        try:
+            with db() as conn, conn.cursor() as c:
+                c.execute("""SELECT direction, text FROM messages
+                             WHERE tg_id=%s AND timestamp <= %s
+                             ORDER BY timestamp DESC LIMIT 10""",
+                          (s["tg_id"], str(s["timestamp"])))
+                rows = list(reversed(c.fetchall()))
+        except Exception:
+            continue
+        if not rows:
+            continue
+        # incoming = fan's last real message; ideal_reply = chatter's closing line(s) after it
+        last_in = None
+        for i in range(len(rows) - 1, -1, -1):
+            t = (rows[i]["text"] or "").strip()
+            if rows[i]["direction"] == "in" and t and not t.startswith("["):
+                last_in = i
+                break
+        if last_in is None:
+            continue
+        incoming = (rows[last_in]["text"] or "").strip()
+        closing = " ".join((r["text"] or "").strip() for r in rows[last_in + 1:]
+                           if r["direction"] == "out" and (r["text"] or "").strip()
+                           and not (r["text"] or "").strip().startswith("["))
+        if not closing:
+            # fallback: the chatter's pitch right before the fan's message
+            for j in range(last_in - 1, -1, -1):
+                t = (rows[j]["text"] or "").strip()
+                if rows[j]["direction"] == "out" and t and not t.startswith("["):
+                    closing = t
+                    break
+        if not incoming or not closing:
+            continue
+        try:
+            _store_example(incoming, closing,
+                           f"winning,{sale_tag},{(s['product'] or '').strip()}",
+                           "good", "winning")
+            mined += 1
+        except Exception as e:
+            print(f"mine store error: {e}")
+    return {"mined_now": mined, "skipped_existing": skipped, "sales_scanned": scanned}
 
 
 if __name__ == "__main__":
