@@ -124,6 +124,28 @@
     </div>
   </div>
 
+  <!-- Preisliste -->
+  <div class="card">
+    <h2>💶 Preisliste (verbindlich)</h2>
+    <div class="sub" style="margin:0 0 8px;">Die EINZIGE gültige Preisquelle. Die AI nennt Preise nur exakt von hier — und erfindet keine mehr. Eine Zeile pro Position, z. B. „PPV Video: 25€", „Custom (5 Min): 60€", „Call 10 Min: 50€".</div>
+    <textarea id="pricelist" style="min-height:130px;" placeholder="PPV Foto-Set: 15€&#10;PPV Video: 25€&#10;Custom Video (5 Min): 60€&#10;Sexting 15 Min: 20€&#10;Call 10 Min: 50€"></textarea>
+    <div class="row" style="margin-top:10px;">
+      <button class="sec" onclick="loadPriceList()">Laden</button>
+      <button onclick="savePriceList()">Preisliste speichern</button>
+      <span id="priceMsg" class="msg dim"></span>
+    </div>
+  </div>
+
+  <!-- Aus Gewinner-Chats lernen -->
+  <div class="card">
+    <h2>🏆 Aus Gewinner-Chats lernen</h2>
+    <div class="sub" style="margin:0 0 8px;">Durchsucht echte Käufe und speichert die Nachrichten, die sie geschlossen haben, als Gold-Beispiele. So lernt die AI, was wirklich Geld bringt. Beliebig oft ausführbar — nichts wird doppelt gelernt.</div>
+    <div class="row">
+      <button onclick="mineWinning()" id="mineBtn">Gewinner-Chats auswerten</button>
+      <span id="mineMsg" class="msg dim"></span>
+    </div>
+  </div>
+
   <!-- Wissen & Regeln -->
   <div class="card">
     <h2>Wissen & Regeln (fernab der Chats)</h2>
@@ -219,7 +241,7 @@ async function ingest(){
   try {
     while(true){
       $('ingestMsg').textContent='lese ein… ('+total+' bisher)'; $('ingestMsg').className='msg dim';
-      const r=await fetch(base()+'/ingest?limit=2000',{method:'POST',headers:hdr()});
+      const r=await fetch(base()+'/ingest?limit=300',{method:'POST',headers:hdr()});
       const d=await r.json(); if(!r.ok) throw new Error(d.detail||('HTTP '+r.status));
       total += (d.embedded_now||0);
       if(d.done || (d.embedded_now||0)===0){ $('ingestMsg').textContent='fertig ✓ ('+total+' neu eingelesen, Rest: '+(d.remaining||0)+')'; $('ingestMsg').className='msg ok'; break; }
@@ -283,6 +305,21 @@ async function loadConfig(){
 async function saveConfig(){
   try { const r=await fetch(base()+'/config',{method:'POST',headers:jhdr(),body:JSON.stringify({persona:$('persona').value})}); if(!r.ok) throw new Error('HTTP '+r.status); $('personaMsg').textContent='gespeichert ✓'; $('personaMsg').className='msg ok'; }
   catch(e){ $('personaMsg').textContent='Fehler: '+e.message; $('personaMsg').className='msg err'; }
+}
+async function loadPriceList(){
+  try { const r=await fetch(base()+'/price-list',{headers:hdr()}); const d=await r.json(); $('pricelist').value=d.price_list||''; $('priceMsg').textContent='geladen'; $('priceMsg').className='msg dim'; }
+  catch(e){ $('priceMsg').textContent='Fehler: '+e.message; $('priceMsg').className='msg err'; }
+}
+async function savePriceList(){
+  try { const r=await fetch(base()+'/price-list',{method:'POST',headers:jhdr(),body:JSON.stringify({price_list:$('pricelist').value})}); if(!r.ok) throw new Error('HTTP '+r.status); $('priceMsg').textContent='gespeichert ✓ — Preise sind jetzt verbindlich'; $('priceMsg').className='msg ok'; }
+  catch(e){ $('priceMsg').textContent='Fehler: '+e.message; $('priceMsg').className='msg err'; }
+}
+async function mineWinning(){
+  $('mineBtn').disabled=true; $('mineMsg').textContent='werte aus…'; $('mineMsg').className='msg dim';
+  try { const r=await fetch(base()+'/mine-winning',{method:'POST',headers:hdr()}); const d=await r.json(); if(!r.ok) throw new Error(d.detail||('HTTP '+r.status));
+    $('mineMsg').textContent='fertig ✓ '+(d.mined_now||0)+' neue Gewinner-Beispiele gelernt (von '+(d.sales_scanned||0)+' Sales, '+(d.skipped_existing||0)+' schon bekannt)'; $('mineMsg').className='msg ok';
+  } catch(e){ $('mineMsg').textContent='Fehler: '+e.message; $('mineMsg').className='msg err'; }
+  $('mineBtn').disabled=false;
 }
 async function loadKnowledge(){
   try { const r=await fetch(base()+'/knowledge',{headers:hdr()}); const d=await r.json(); const items=d.items||[];
@@ -368,7 +405,7 @@ if($('chatIn')){
 }
 
 // Auto-load persona + knowledge if connection is already set (und Admin)
-if (!window.__AI_BLOCKED__ && $('url') && $('url').value && $('token').value) { loadConfig(); loadKnowledge(); }
+if (!window.__AI_BLOCKED__ && $('url') && $('url').value && $('token').value) { loadConfig(); loadKnowledge(); loadPriceList(); }
 </script>
 </body>
 </html>
