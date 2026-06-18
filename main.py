@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import json
 import time
+import datetime
 from typing import Optional, List
 
 import psycopg2
@@ -307,6 +308,82 @@ def _mem_block(tg_id: str) -> str:
     m = _get_fan_memory(tg_id)
     return ("\n\nWHAT YOU ALREADY KNOW ABOUT THIS FAN (long-term memory — use it to feel like you "
             "remember everything about them):\n" + m) if m else ""
+
+
+def _ago(dt) -> str:
+    """Human 'time ago' from a timestamp (datetime or iso string)."""
+    if not dt:
+        return "unknown"
+    try:
+        if not isinstance(dt, datetime.datetime):
+            dt = datetime.datetime.fromisoformat(str(dt).replace("Z", "+00:00"))
+        if dt.tzinfo:
+            dt = dt.replace(tzinfo=None)
+        secs = (datetime.datetime.utcnow() - dt).total_seconds()
+    except Exception:
+        return "unknown"
+    if secs < 0:
+        secs = 0
+    if secs < 3600:
+        return f"{int(secs // 60)} min ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)} h ago"
+    return f"{int(secs // 86400)} days ago"
+
+
+_OFFER_HINTS = ("€", "eur", "preis", "kostet", "paypal", "revolut", "ppv", "video", "call",
+                "sexting", "angebot", "schick", "send", "zahlung", "überweis", "paysafe")
+
+def _continuity_block(tg_id: str) -> str:
+    """The 'pick up where you left off' block: time gap, last offer, open/unpaid, last purchase.
+    This is what stops every reply from feeling like a cold restart."""
+    try:
+        with db() as conn, conn.cursor() as c:
+            c.execute("SELECT direction, text, timestamp FROM messages WHERE tg_id=%s ORDER BY id DESC LIMIT 40", (tg_id,))
+            msgs = c.fetchall()
+            c.execute("SELECT product, amount, timestamp FROM sales WHERE tg_id=%s ORDER BY id DESC LIMIT 1", (tg_id,))
+            last_sale = c.fetchone()
+    except Exception:
+        return ""
+    if not msgs:
+        return ""
+    last_in = next((m for m in msgs if m["direction"] == "in"), None)
+    last_out = next((m for m in msgs if m["direction"] == "out"), None)
+    lines = []
+    if last_in:
+        lines.append(f"- Fan's last message: {_ago(last_in.get('timestamp'))}.")
+    else:
+        lines.append("- This fan has not written yet — you spoke last.")
+    # detect an open (made-but-unpaid) offer: a recent outbound that looks like an offer
+    last_offer = None
+    for m in msgs:
+        if m["direction"] == "out" and any(h in (m["text"] or "").lower() for h in _OFFER_HINTS):
+            last_offer = m
+            break
+    sale_ts = last_sale.get("timestamp") if last_sale else None
+    if last_offer:
+        offer_after_sale = True
+        if sale_ts:
+            try:
+                ot = datetime.datetime.fromisoformat(str(last_offer.get("timestamp")).replace("Z", "+00:00"))
+                st = datetime.datetime.fromisoformat(str(sale_ts).replace("Z", "+00:00"))
+                offer_after_sale = ot > st
+            except Exception:
+                offer_after_sale = True
+        snippet = (last_offer.get("text") or "")[:140]
+        if offer_after_sale:
+            lines.append(f"- OPEN OFFER you already made (NOT yet paid): \"{snippet}\" ({_ago(last_offer.get('timestamp'))}). "
+                         "Pick this exact thread back up — don't restart from zero, chase THIS to the close.")
+        else:
+            lines.append(f"- Last offer you made: \"{snippet}\" (already paid).")
+    if last_sale:
+        lines.append(f"- Last purchase: {last_sale.get('product') or 'sale'} ({_to_float(last_sale.get('amount')):.0f}€), {_ago(sale_ts)}.")
+    else:
+        lines.append("- No purchase yet — first sale still to land.")
+    if not lines:
+        return ""
+    return ("\n\nCONTINUITY — you are continuing an ONGOING relationship, never a cold start. "
+            "Pick up exactly where you left off:\n" + "\n".join(lines))
 
 
 def _grounding_block(know_txt: str = None, include_price: bool = True) -> str:
@@ -645,7 +722,7 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
         "GOLD-STANDARD examples — follow this approach and tone closely:\n"
         + (gold_txt or "(none yet)") + "\n\n"
         "Style references from past chats (do not copy verbatim):\n" + (style_txt or "(none)") + "\n\n"
-        "Fan profile:\n" + prof_txt + tier_txt + _mem_block(tg_id) + "\n"
+        "Fan profile:\n" + prof_txt + tier_txt + _mem_block(tg_id) + _continuity_block(tg_id) + "\n"
         "Available PPV files you may send (use EXACT names):\n" + ppv_txt + "\n\n"
         "Available call recordings (folder/filename) you may play:\n" + calls_txt + "\n\n"
         + (("CONTENT GUIDE (what your PPV files & call recordings contain — match these to the lists "
@@ -653,6 +730,17 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
         + "PAYMENT STATUS: " + pay_txt + "\n\n"
         "HARD RULES:\n"
         "- Only reference files that appear in the available lists above.\n"
+        "- CALLING — ACT, DON'T PROMISE: If the fan asks for a call, a fake check, a 'check', a "
+        "video/voice verification, or says things like 'ruf mich an' / 'call me' / 'mach den fake "
+        "check', AND there is a matching recording in the available call list (a 'fake_checks/...' "
+        "entry for a free check, or a 'paid_calls/...' entry only when payment is confirmed), then you "
+        "MUST start it RIGHT NOW by calling the start_call tool in THIS SAME turn. NEVER say you will "
+        "call 'gleich', 'sofort', 'in a moment', 'später' or any future promise WITHOUT also firing "
+        "start_call now — a promise without the tool call means no call ever happens. Keep any reply "
+        "text tiny (e.g. 'okay ich ruf dich kurz an 🥰') and fire the tool. If there is NO suitable "
+        "recording in the available call list, do NOT promise a call you cannot make — instead offer "
+        "the alternative you actually can do (e.g. a quick voice/text) or ask them to confirm payment "
+        "first if it's a paid call.\n"
         "- For refunds, upset fans, or anything risky/sensitive, put [[HANDOFF]] in your reply and take no action.\n"
         "- PAYMENT PROOF: If the fan sends an IMAGE, look at it. If it is a payment-confirmation "
         "screenshot showing a COMPLETED payment with an amount, treat the payment as done: call "
@@ -663,6 +751,8 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
     user = ("Recent conversation (YOU = the chatter, FAN = the subscriber):\n" + convo_txt + "\n\n"
             "Decide the single best next move as YOU. Write the reply text (short, natural, the fan's language). "
             "If an action fits (send PPV, change funnel stage, start a call, log a sale), call the matching tool. "
+            "If the fan asked to be called / for a fake check and a recording is available, you MUST fire "
+            "start_call in THIS turn — do not just promise it in words. "
             "If nothing beyond replying is needed, just write the reply.")
 
     if body.image_b64:
@@ -721,7 +811,7 @@ def followup(body: FollowupIn, authorization: Optional[str] = Header(None)):
     sys = (_get_persona() + "\n\n" + _grounding_block() + "\n\n"
            f"Fan: {prof.get('internal_name') or prof.get('anon_id') or tg_id} | "
            f"stage: {prof.get('funnel_stage') or '-'} | tier: {tier_label}\n"
-           f"SALES TACTIC FOR THIS FAN: {tier_tactic}" + _mem_block(tg_id))
+           f"SALES TACTIC FOR THIS FAN: {tier_tactic}" + _mem_block(tg_id) + _continuity_block(tg_id))
     ctx_line = (f"CONTEXT: {body.context}\n" if (body.context or "").strip() else "")
     user = (ctx_line
             + "This fan went quiet after your last message. Write ONE short, charming follow-up as YOU "
@@ -758,7 +848,7 @@ def refresh_memory(body: MemoryIn, authorization: Optional[str] = Header(None)):
         c.execute("SELECT msg_count FROM fan_memory WHERE tg_id=%s", (tg_id,))
         row = c.fetchone()
         prev = row["msg_count"] if row else -1
-    if not body.force and prev >= 0 and (total - prev) < 4:
+    if not body.force and prev >= 0 and (total - prev) < 2:
         return {"updated": False, "reason": "no new messages"}
     with db() as conn, conn.cursor() as c:
         c.execute("SELECT internal_name, anon_id, notes, funnel_stage FROM conversations WHERE tg_id=%s", (tg_id,))
