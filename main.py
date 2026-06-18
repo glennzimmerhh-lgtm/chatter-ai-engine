@@ -175,6 +175,26 @@ def _spend_tier(total: float):
             "Has not bought yet. Focus on rapport and a low-friction first offer to convert.")
 
 
+# Selective escalation: mini by default, strong model only where it moves revenue.
+ESCALATE_SPEND = float(os.environ.get("AI_ESCALATE_SPEND", "100"))   # € lifetime → use strong model
+ESCALATE_STAGES = {"angebot", "gebucht"}                            # offer made / booked = closing zone
+ESCALATE_SIGNALS = ("kauf", "preis", "kost", "zahl", "bezahl", "teuer", "bestell", "bundle",
+                    "buy", "price", "cost", "pay ", "how much", "wie viel", "wieviel", "custom")
+
+def _reply_model_for(total_spend: float, funnel_stage: str, latest_in: str) -> str:
+    """Pick the cheap model unless this is a high-value fan or a key sales moment."""
+    if REPLY_MODEL == AI_MODEL:
+        return AI_MODEL  # no separate strong model configured → always cheap
+    if total_spend >= ESCALATE_SPEND:
+        return REPLY_MODEL
+    if (funnel_stage or "") in ESCALATE_STAGES:
+        return REPLY_MODEL
+    low = (latest_in or "").lower()
+    if any(s in low for s in ESCALATE_SIGNALS):
+        return REPLY_MODEL
+    return AI_MODEL
+
+
 def _get_fan_memory(tg_id: str) -> str:
     try:
         with db() as conn, conn.cursor() as c:
@@ -406,7 +426,7 @@ def draft(tg_id: str,
     )
 
     chat = client.chat.completions.create(
-        model=REPLY_MODEL,
+        model=_reply_model_for(total_spend, prof.get("funnel_stage"), latest_in),
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
         temperature=0.8, max_tokens=700,
     )
@@ -533,7 +553,7 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
             "If nothing beyond replying is needed, just write the reply.")
 
     resp = client.chat.completions.create(
-        model=REPLY_MODEL,
+        model=_reply_model_for(total_spend, prof.get("funnel_stage"), latest_in),
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
         tools=ACT_TOOLS, tool_choice="auto",
         temperature=0.7, max_tokens=700,
@@ -586,7 +606,7 @@ def followup(body: FollowupIn, authorization: Optional[str] = Header(None)):
             "Recent conversation (YOU = the chatter, FAN = the subscriber):\n" + convo_txt
             + "\n\nOutput ONLY the message text.")
     chat = client.chat.completions.create(
-        model=REPLY_MODEL,
+        model=_reply_model_for(total_spend, prof.get("funnel_stage"), ""),
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
         temperature=0.85, max_tokens=200,
     )
