@@ -657,6 +657,12 @@ ACT_TOOLS = [
             "product": {"type": "string", "description": "what was sold, e.g. 'PPV Video', 'Call 10min', 'Sexting 30min'"},
             "method": {"type": "string", "description": "payment method: PayPal, Revolut, Überweisung, Paysafe, Amazon"}},
             "required": ["amount"]}}},
+    {"type": "function", "function": {
+        "name": "ask_admin",
+        "description": "Ask the human operator a question when you are genuinely unsure and must NOT guess. Use this instead of replying whenever: the fan asks something you cannot answer from the persona/knowledge/price list; a price, detail, or policy is missing or ambiguous; the fan wants something you don't know is allowed/available; or any situation where a wrong guess could lose the sale or look fake. When you call this, do NOT also write a reply to the fan — stay silent toward the fan and wait for the operator's answer. Ask a short, specific question.",
+        "parameters": {"type": "object", "properties": {
+            "question": {"type": "string", "description": "the precise question for the operator, with just enough context to answer quickly"}},
+            "required": ["question"]}}},
 ]
 
 @app.post("/act", response_model=ActOut)
@@ -729,6 +735,11 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
             "above to pick the perfect one):\n" + _get_content_guide() + "\n\n") if _get_content_guide() else "")
         + "PAYMENT STATUS: " + pay_txt + "\n\n"
         "HARD RULES:\n"
+        "- ASK, DON'T GUESS: If you are genuinely unsure or missing information — the fan asks "
+        "something you can't answer from the persona/knowledge/price list, a price/detail/policy is "
+        "unclear, or guessing could lose the sale or look fake — call the ask_admin tool with a short, "
+        "specific question for the operator and write NO reply to the fan. Wait for the operator. Do "
+        "NOT invent facts, prices, or promises. Only ask when truly needed (not for normal small talk).\n"
         "- Only reference files that appear in the available lists above.\n"
         "- CALLING — ACT, DON'T PROMISE: If the fan asks for a call, a fake check, a 'check', a "
         "video/voice verification, or says things like 'ruf mich an' / 'call me' / 'mach den fake "
@@ -831,6 +842,53 @@ def followup(body: FollowupIn, authorization: Optional[str] = Header(None)):
     handoff = "[[HANDOFF]]" in out
     out = out.replace("[[HANDOFF]]", "").strip()
     return FollowupOut(reply=out, handoff=handoff)
+
+
+# ── COMPOSE: turn the operator's answer into a natural fan reply ───────────────
+class ComposeIn(BaseModel):
+    tg_id: str
+    guidance: str          # the operator's answer / instruction
+    question: str = ""     # the question the AI had asked (for context)
+
+class ComposeOut(BaseModel):
+    reply: str
+
+@app.post("/compose", response_model=ComposeOut)
+def compose(body: ComposeIn, authorization: Optional[str] = Header(None)):
+    """The operator answered the AI's question. Write the fan-facing reply in persona/style,
+    using the operator's answer as the ground truth — do NOT contradict it or invent extra."""
+    _auth(authorization)
+    tg_id = body.tg_id
+    with db() as conn, conn.cursor() as c:
+        c.execute("SELECT internal_name, anon_id, notes, funnel_stage FROM conversations WHERE tg_id=%s", (tg_id,))
+        prof = c.fetchone() or {}
+        c.execute("SELECT direction, text FROM messages WHERE tg_id=%s ORDER BY id DESC LIMIT 15", (tg_id,))
+        hist = list(reversed(c.fetchall()))
+        c.execute("SELECT product, amount FROM sales WHERE tg_id=%s ORDER BY id DESC LIMIT 10", (tg_id,))
+        sales = c.fetchall()
+    total_spend = sum(_to_float(s["amount"]) for s in sales)
+    tier_label, tier_tactic = _spend_tier(total_spend)
+    convo_txt = "\n".join(f"{'FAN' if m['direction']=='in' else 'YOU'}: {m['text']}" for m in hist)
+    sys = (_get_persona() + "\n\n" + _behavior_block() + "\n\n" + _grounding_block() + "\n\n"
+           f"Fan: {prof.get('internal_name') or prof.get('anon_id') or tg_id} | "
+           f"stage: {prof.get('funnel_stage') or '-'} | tier: {tier_label}\n"
+           f"SALES TACTIC FOR THIS FAN: {tier_tactic}" + _mem_block(tg_id) + _continuity_block(tg_id))
+    qline = (f"Earlier you were unsure and asked the operator: \"{body.question}\"\n" if (body.question or "").strip() else "")
+    user = (qline +
+            "The operator just answered you. THIS IS THE GROUND TRUTH — build your reply on it, never "
+            "contradict it and don't invent anything beyond it:\n\"" + (body.guidance or "") + "\"\n\n"
+            "Now write the next message to the fan as YOU — natural, in their language, in your usual "
+            "style, moving things forward toward the sale where it fits. If the operator's answer means "
+            "you should send a price/offer, do it cleanly.\n\n"
+            "Recent conversation (YOU = the chatter, FAN = the subscriber):\n" + convo_txt
+            + "\n\nOutput ONLY the message text.")
+    chat = client.chat.completions.create(
+        model=_reply_model_for(total_spend, prof.get("funnel_stage"), ""),
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        temperature=0.7, max_tokens=300,
+    )
+    out = (chat.choices[0].message.content or "").strip()
+    return ComposeOut(reply=out)
 
 
 # ── FAN MEMORY (build/refresh the living per-fan profile — runs in background) ─
