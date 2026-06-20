@@ -447,6 +447,14 @@ def setup():
                 msg_count  INT DEFAULT 0,
                 updated_at TIMESTAMPTZ DEFAULT now()
             )""")
+            # Onboarding gaps: things the AI says it still needs to know to do its job.
+            c.execute("""CREATE TABLE IF NOT EXISTS training_questions (
+                id         SERIAL PRIMARY KEY,
+                question   TEXT,
+                answer     TEXT DEFAULT '',
+                status     TEXT DEFAULT 'open',
+                created_at TIMESTAMPTZ DEFAULT now()
+            )""")
             conn.commit()
         print("✅ message_embeddings ready (pgvector)")
     except Exception as e:
@@ -1136,6 +1144,110 @@ def del_knowledge(kid: int, authorization: Optional[str] = Header(None)):
     _auth(authorization)
     with db() as conn, conn.cursor() as c:
         c.execute("DELETE FROM knowledge WHERE id=%s", (kid,))
+        conn.commit()
+    return {"ok": True}
+
+
+# ── ONBOARDING: the AI tells you what it still needs to know ───────────────────
+@app.get("/training-questions")
+def list_training_questions(authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    with db() as conn, conn.cursor() as c:
+        c.execute("SELECT id, question, status, created_at FROM training_questions "
+                  "WHERE status='open' ORDER BY id ASC")
+        return {"items": c.fetchall()}
+
+@app.post("/training-questions/generate")
+def generate_training_questions(authorization: Optional[str] = Header(None)):
+    """The AI reviews what it already knows and lists the most important gaps it still
+    needs filled to chat & sell convincingly as her. Stores them as open questions."""
+    _auth(authorization)
+    persona = _get_persona()
+    price_list = _get_price_list()
+    pay = _get_payment_terms()
+    guide = _get_content_guide()
+    know = _get_knowledge()
+    know_txt = "\n".join(f"- {k['content']}" for k in know)
+    with db() as conn, conn.cursor() as c:
+        c.execute("SELECT question FROM training_questions ORDER BY id DESC LIMIT 200")
+        existing = [r["question"] for r in c.fetchall()]
+    existing_txt = "\n".join(f"- {q}" for q in existing) or "(none yet)"
+    sys = ("You are onboarding an AI that will chat and sell as an adult content creator, taking over "
+           "from human chatters. Your job: find the GAPS — the concrete things still missing or unclear "
+           "that the AI must know to sound real and close sales. Be specific and practical.")
+    user = (
+        "WHAT IS ALREADY CONFIGURED:\n"
+        f"Persona:\n{persona or '(empty)'}\n\n"
+        f"Price list:\n{price_list or '(empty)'}\n\n"
+        f"Payment terms:\n{pay or '(empty)'}\n\n"
+        f"Content guide (what media/calls exist):\n{guide or '(empty)'}\n\n"
+        f"Known facts/rules:\n{know_txt or '(none)'}\n\n"
+        f"Questions already asked before (do NOT repeat these):\n{existing_txt}\n\n"
+        "List the 6-10 MOST important still-open questions you need answered to do this job well — "
+        "things like missing prices, payment methods, persona details (name/age/location/backstory), "
+        "hard limits / no-gos, what content actually exists, how to handle common objections, booking "
+        "logistics, etc. Only NEW gaps not already covered above. Write each as a short, direct question "
+        "in GERMAN, addressed to the operator. "
+        "Output ONLY a JSON array of strings, nothing else.")
+    try:
+        chat = client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            temperature=0.5, max_tokens=600,
+        )
+        raw = (chat.choices[0].message.content or "").strip()
+    except Exception as e:
+        raise HTTPException(500, f"generation failed: {e}")
+    # tolerant JSON parse
+    import re as _re
+    qs = []
+    try:
+        m = _re.search(r"\[.*\]", raw, _re.DOTALL)
+        if m:
+            qs = json.loads(m.group(0))
+    except Exception:
+        qs = []
+    if not qs:
+        qs = [ln.lstrip("-•0123456789. ").strip() for ln in raw.splitlines() if len(ln.strip()) > 8]
+    existing_lc = {(q or "").strip().lower() for q in existing}
+    added = 0
+    with db() as conn, conn.cursor() as c:
+        for q in qs:
+            q = (str(q) or "").strip()
+            if len(q) < 6 or q.lower() in existing_lc:
+                continue
+            c.execute("INSERT INTO training_questions (question, status) VALUES (%s,'open')", (q[:500],))
+            existing_lc.add(q.lower())
+            added += 1
+        conn.commit()
+    return {"ok": True, "added": added}
+
+class TQAnswerIn(BaseModel):
+    answer: str
+
+@app.post("/training-questions/{qid}/answer")
+def answer_training_question(qid: int, body: TQAnswerIn, authorization: Optional[str] = Header(None)):
+    """Operator answers an onboarding question → it becomes permanent knowledge the AI uses."""
+    _auth(authorization)
+    ans = (body.answer or "").strip()
+    if not ans:
+        raise HTTPException(400, "empty answer")
+    with db() as conn, conn.cursor() as c:
+        c.execute("SELECT question FROM training_questions WHERE id=%s", (qid,))
+        row = c.fetchone()
+        if not row:
+            raise HTTPException(404, "question not found")
+        fact = f"Frage: {row['question']}\nAntwort/Regel: {ans}"
+        c.execute("INSERT INTO knowledge (content) VALUES (%s)", (fact[:2000],))
+        c.execute("UPDATE training_questions SET answer=%s, status='answered' WHERE id=%s", (ans[:2000], qid))
+        conn.commit()
+    return {"ok": True}
+
+@app.post("/training-questions/{qid}/dismiss")
+def dismiss_training_question(qid: int, authorization: Optional[str] = Header(None)):
+    _auth(authorization)
+    with db() as conn, conn.cursor() as c:
+        c.execute("UPDATE training_questions SET status='dismissed' WHERE id=%s", (qid,))
         conn.commit()
     return {"ok": True}
 
