@@ -804,6 +804,63 @@ def act(body: ActIn, authorization: Optional[str] = Header(None)):
     return ActOut(reply=reply, actions=actions, handoff=handoff)
 
 
+# ── VERIFY PAYMENT SCREENSHOT (chatter clicks a screenshot → AI reads it) ──────
+class VerifyPayIn(BaseModel):
+    image_b64: str
+
+@app.post("/verify-payment")
+def verify_payment(body: VerifyPayIn, authorization: Optional[str] = Header(None)):
+    """Read a payment-confirmation screenshot and judge whether it shows a REAL, COMPLETED,
+    already-SENT transfer. Returns structured JSON. (A screenshot only proves what it shows —
+    it can be edited; this checks for a clearly completed payment and obvious fakes.)"""
+    _auth(authorization)
+    if not body.image_b64:
+        raise HTTPException(400, "no image")
+    sysmsg = ("You verify payment-confirmation screenshots (Revolut, PayPal, bank transfer, "
+              "Paysafe, Apple Pay) for a CRM. Judge ONLY what the image shows. A payment counts "
+              "as completed ONLY if the screenshot clearly shows the money was already SENT / "
+              "transfer SUCCESSFUL / Completed — NOT a pending state, NOT a payment request, NOT "
+              "just an amount typed somewhere. If the image looks edited, inconsistent, cropped to "
+              "hide status, or is not a payment at all, completed=false.")
+    user_content = [
+        {"type": "text", "text":
+            "Look carefully at this screenshot. Respond with STRICT JSON only, no prose:\n"
+            "{\"is_payment\": true/false, \"completed\": true/false, \"amount\": \"<number or ''>\", "
+            "\"currency\": \"EUR/USD/...\", \"provider\": \"Revolut/PayPal/Bank/Paysafe/ApplePay/Unknown\", "
+            "\"reason\": \"<short why>\"}"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + body.image_b64}},
+    ]
+    try:
+        resp = client.chat.completions.create(
+            model=REPLY_MODEL,
+            messages=[{"role": "system", "content": sysmsg},
+                      {"role": "user", "content": user_content}],
+            temperature=0, max_tokens=300,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        raise HTTPException(500, f"vision failed: {e}")
+    import re as _re
+    data = {}
+    try:
+        m = _re.search(r"\{.*\}", raw, _re.DOTALL)
+        if m:
+            data = json.loads(m.group(0))
+    except Exception:
+        data = {}
+    amt_raw = str(data.get("amount", "") or "")
+    am = _re.search(r"\d+(?:[.,]\d+)?", amt_raw)
+    amount = am.group(0).replace(",", ".") if am else ""
+    return {
+        "is_payment": bool(data.get("is_payment")),
+        "completed": bool(data.get("completed")) and bool(amount),
+        "amount": amount,
+        "currency": (str(data.get("currency", "EUR")) or "EUR")[:8],
+        "provider": (str(data.get("provider", "Unknown")) or "Unknown")[:20],
+        "reason": str(data.get("reason", ""))[:300],
+    }
+
+
 # ── FOLLOW-UP: re-engage a fan who went quiet (recover lost sales) ────────────
 class FollowupIn(BaseModel):
     tg_id: str
